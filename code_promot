@@ -103,4 +103,253 @@ https://github.com/w00514231/GPU-
 
 详细方案和本次对话已同步到 [GitHub 的 code_promot](https://github.com/w00514231/GPU-/blob/main/code_promot)。下一步最关键的是确定：每 CU 最多驻留多少个 wave、SGPR/VGPR 的 bank 与读端口配置、SMEM 和 VMEM 是否共用 memory issue 入口。
 
+## 2026-10-18：详细方案讨论与确认项（补记）
 
+### 用户
+
+详细方案你先和我讨论确认，详细的设计方案需要包含架构图，方案确认后写入另一个文件中
+
+### 助手：讨论方式
+
+先逐项讨论并确认，架构图随方案迭代。确认后的设计单独保存为 `gpu_issue_architecture.md`，对话仍归 `code_promot`。此前规划模式期间未写入文件，本节补记该阶段的讨论和选择。
+
+4 IPC 是每个 scala、SMEM、VALU、VMEM 路径各一个入口这一假设下的峰值，wave32 本身不限定四条。需要分别统计进入 collector 和执行入口实际接收的吞吐量。只按顺序进入 collector，仍可能出现后续指令先读寄存器或先执行，因此必须进一步确定保序边界。
+
+### 逐项讨论与用户选择
+
+1. issue 模块管理范围：
+   - 用户选择：一个 scala + 一个 vector。
+2. 同 wave 发射能力：
+   - 用户选择：保序单发射；每 wave 每周期最多推进一条，依靠多个 wave 填满不同入口。
+3. SGPR/VGPR 与 memory 接口约束：
+   - 用户选择：都可一起设计。
+4. scala engine 内 SALU 与 SCTL 的组织：
+   - 用户选择：独立流水线，允许不同 wave 的 SALU 和 SCTL 同周期接收。
+5. 跨域寄存器：
+   - 用户选择：允许跨域访问。需要标量源送往 vector engine，以及向量结果写 SGPR/VCC/EXEC 等状态的依赖与写回通路。
+6. 第一版执行资源边界：
+   - 用户选择：每类一个入口，每类至多接收一条/周期。
+7. ISA 基础：
+   - 用户问：是否可以兼容AMD的最新ISA。
+8. 保序边界：
+   - 用户选择：上一条被执行入口接收后，同 wave 下一条才能进入 operand collector。
+9. 异常要求：
+   - 最初未回答，后续明确排除可恢复 trap、抢占和上下文切换。
+
+### 助手：五入口结构与峰值
+
+SALU、SCTL、SMEM、VALU、VMEM 各有独立执行入口，理想峰值是五条来自不同 wave 的架构指令/周期。SGPR 可能同时服务五类指令，不能只计算 SALU/SCTL/SMEM 的 SGPR 需求。跨域操作数按指令标签传输。每 wave 只有一条尚未发射的 collector 指令；已经发射的指令可继续执行或等待访存。
+
+```mermaid
+flowchart TB
+    W["每 wave 指令缓冲：仅队首参与"]
+    S["依赖检查、五类候选选择与资源预留"]
+    W --> S
+    subgraph SCALA["scala engine"]
+        SR["SGPR 读取仲裁"]
+        SALU["SALU collector → SALU"]
+        SCTL["SCTL collector → SCTL"]
+        SMEM["SMEM collector → 请求队列"]
+        SR --> SALU
+        SR --> SCTL
+        SR --> SMEM
+    end
+    subgraph VECTOR["vector engine"]
+        VR["VGPR 读取仲裁"]
+        VALU["VALU collector → VALU"]
+        VMEM["VMEM collector → 请求队列"]
+        VR --> VALU
+        VR --> VMEM
+    end
+    S --> SALU
+    S --> SCTL
+    S --> SMEM
+    S --> VALU
+    S --> VMEM
+    SR -->|"带标签的标量源"| VALU
+    SR -->|"带标签的标量源"| VMEM
+    VALU --> WB["完成、跨域结果与状态写回"]
+    SALU --> WB
+    SCTL --> WB
+    SMEM --> WB
+    VMEM --> WB
+    WB --> S
+```
+
+### 助手：AMD ISA 查询与建议
+
+查询 AMD 官方公开资料后，公开列表已包括 CDNA5，ISA 手册日期为 2026-07-27，并有机器可读 XML。CDNA5 采用 wave32。issue 内部结构可以自行设计，但支持范围内的指令必须保持相应可见语义。
+
+- 固定一个版本，避免使用不断变化的“最新 ISA”作为规范。
+- 向量指令的 SGPR 源和特殊状态隐含读写都进入依赖描述。
+- SCTL 覆盖 branch、等待计数器和同步等支持的语义。
+- LDS/DS、矩阵、Tensor Data Mover、双操作指令等能力必须明确支持范围。
+- 内部微操作吞吐量与架构指令 IPC 分别统计。
+- 完整 ISA 兼容和直接运行 HIP/ROCm 程序分别验收；后者还涉及 ABI、装载、内存模型和运行时。
+
+参考：
+[AMD 机器可读 ISA](https://gpuopen.com/machine-readable-isa/)
+[CDNA5 官方手册](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf)
+
+### 后续逐项讨论与用户选择
+
+10. AMD 版本：
+    - 用户选择：采用 CDNA5。
+11. 第一版兼容范围：
+    - 用户选择：五类指令子集，明确 opcode 清单，其余类别保留扩展接口。
+12. RF 带宽取向：
+    - 用户选择：比较基本带宽与高带宽两档配置，依据 IPC 与时序/面积估计决定端口数。
+13. 调度器 wave 槽位：
+    - 用户选择：32 个槽位作为基准，并用 16/32/64 参数扫描；实际驻留数仍受寄存器分配限制。
+14. 恢复范围：
+    - 用户选择：第一版排除可恢复 trap、抢占和上下文切换，错误终止 wave，并处理在途请求收尾。
+15. 落地目标：
+    - 用户选择：面向 ASIC 的 RTL。
+16. 工艺、频率和存储宏：
+    - 用户选择：尚未确定；先描述参数化微架构与时序边界，不承诺具体频率和面积。
+
+### 助手：性能目标补充
+
+五入口提供混合指令峰值。如果程序有 80% VALU，且 VALU 每周期只接收一条，忽略其他阻塞时总 IPC 上限是 1/0.8=1.25。验收需覆盖理想混合、计算密集和访存密集场景，而不是只看五类均衡的理想情况。
+
+### 助手：上一轮最终回复
+
+我们按 **CDNA5 五类指令子集、wave32、面向 ASIC 的 RTL**继续设计。工艺和频率暂未确定，因此先明确流水级、端口需求和容量参数，具体面积与频率需要结合存储宏和综合结果评估。
+
+现在先讨论 issue 的主数据流。我建议采用**两次调度：先选指令收集操作数，再选择操作数齐备的指令进入执行单元**。
+
+```mermaid
+flowchart TB
+    IB["32 个 wave 的指令缓冲<br/>每个 wave 仅队首参与选择"]
+    CTX["每 wave 上下文<br/>PC、EXEC、模式和等待状态"]
+    DEP["依赖检查<br/>SGPR / VGPR / 特殊状态"]
+    PICK["五类候选选择<br/>每类每周期最多选一条"]
+    ALLOC["分配 collector 条目<br/>预留目标寄存器与指令标签"]
+    IB --> DEP
+    CTX --> DEP
+    DEP --> PICK --> ALLOC
+    subgraph SE["scala engine"]
+        SG["SGPR<br/>bank 读取仲裁"]
+        SC["独立 collector 条目<br/>SALU / SCTL / SMEM"]
+        SL["SALU 流水线"]
+        ST["SCTL 流水线"]
+        SM["SMEM 请求队列"]
+        SG --> SC
+        SC --> SL
+        SC --> ST
+        SC --> SM
+    end
+    subgraph VE["vector engine"]
+        VG["VGPR<br/>bank 读取仲裁"]
+        VC["独立 collector 条目<br/>VALU / VMEM"]
+        VL["VALU 流水线"]
+        VM["VMEM 请求队列"]
+        VG --> VC
+        VC --> VL
+        VC --> VM
+    end
+    ALLOC --> SC
+    ALLOC --> VC
+    SG -->|"带标签的标量操作数"| VC
+    SL --> WB["完成反馈与写回缓冲<br/>SGPR / VGPR / 特殊状态"]
+    ST --> WB
+    SM --> WB
+    VL --> WB
+    VM --> WB
+    WB --> DEP
+    WB --> CTX
+    WB -->|"各自写回仲裁"| SG
+    WB -->|"各自写回仲裁"| VG
+```
+
+这张图中，三个时刻需要严格区分：
+
+| 时刻 | 硬件动作 | 对同一 wave 的影响 |
+|---|---|---|
+| 进入 collector | 分配条目，记录源操作数与目标，设置在途状态 | 后续指令继续等待 |
+| 收集操作数 | 按 bank 可用情况读取，跨域操作数按标签送达 | 可以跨多个周期 |
+| 执行入口接收 | 操作数齐备且执行资源允许，完成发射握手 | 下一条指令可以进入收集阶段 |
+
+这样，**bank 冲突只延长相关指令的收集过程**；其他 wave 可以继续读取或执行。调度器同时统计进入 collector 的吞吐量和执行入口接收的 IPC，防止队列暂时堆积掩盖执行瓶颈。
+
+完成路径也要解耦。对于延迟不固定的访存，不能在发射时预定某个未来周期的寄存器写端口；应预留返回缓冲容量，结果到达后再仲裁写回。scoreboard 只有在结果已经写入，或存在明确可用的旁路时，才能唤醒消费者。
+
+CDNA5 兼容性还要求跟踪隐含状态。例如 VALU 可能访问标量操作数、写 VCC 或 EXEC，寄存器寻址也可能受模式状态影响；这些都必须成为指令依赖描述的一部分。[CDNA5 官方手册](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf)
+
+接下来重点比较两档 RF 带宽配置，并结合各类指令的操作数需求确定 collector 深度和仲裁方式。**最终设计文件仍待方案确认后写入**；本轮新增对话尚未同步 GitHub，进入执行阶段时会补记到 `code_promot`。
+
+## 数据依赖讨论
+
+### 用户
+
+对于数据的dependency你是如何考虑的，比对WAR, RAW, WAW这些冲突类型如何解决
+
+### 助手
+
+建议第一版用 **scoreboard 处理 RAW/WAW，用“保序发射＋源数据完整锁存”避免 WAR**。检查范围是同一 wave 的寄存器及特殊状态；不同 wave 的寄存器各自独立，仍会争用 RF 端口和 bank。
+
+| 冲突 | 例子：I0 比 I1 更早 | 当前方案的处理 |
+|---|---|---|
+| RAW：先写后读 | I0 写 v4，I1 读 v4 | I1 等待 I0 的结果写回，或从有效旁路获取结果 |
+| WAR：先读后写 | I0 读 v4，I1 写 v4 | I0 的全部源数据锁存并被执行入口接收后，I1 才能进入 collector |
+| WAW：先写后写 | I0 写 v4，I1 也写 v4 | I1 等 I0 对 v4 的写入真正完成，再预留 v4 |
+
+**RAW：按源寄存器检查生产者。** 每个寄存器维护 `pending_writer` 和生产者标签。比如：
+
+```text
+I0: VMEM load v4, [address]   // 长延迟
+I1: VALU v6 = v4 + v2        // RAW，等待 v4
+```
+
+I0 预留 v4 后，I1 就不能把 RF 中的旧 v4 当成输入。第一版可以等写回后再放行；为了提升 IPC，可以增加带标签的旁路，让 collector 提前锁存已经产生的结果。旁路必须能确认生产者、数据有效性和实际接收成功，不能仅根据“预计这周期完成”放行。部分写入的旁路还必须正确合并未改写的位或 lane；不支持这种合并时，等待 RF 写回。
+
+**WAR：关键是旧指令已经取得数据。** 我们已选择：同一 wave 的旧指令被执行入口接收后，下一条才能进入 collector。因此需要把接口约定写清楚：
+
+> 执行入口接收指令时，这条指令需要的全部源数据已经锁存；后续执行不能再凭寄存器编号读取可能变化的 RF 内容。
+
+例如：
+
+```text
+I0: VMEM store [v0:v1], v4
+I1: VALU v4 = v6 + v8
+```
+
+I0 必须先取得地址和 store 数据 v4，I1 才能推进。I0 的访存请求可以很晚才到达 memory，但保存的是旧 v4 的数据，I1 后续修改 v4 不会影响它。
+
+如果 VMEM 入口只接收寄存器编号，等下游空闲后才读取 store 数据，这个 WAR 保证就失效了。那时必须增加未完成读的跟踪，并阻止较年轻的写入。
+
+**WAW：第一版阻止同一寄存器同时存在两个未完成写者。** 例如：
+
+```text
+I0: VMEM load v4, [address]   // 较晚返回
+I1: VALU v4 = v6 + v8        // 本来可能较早完成
+```
+
+如果允许 I1 先写回，I0 随后返回就会覆盖新结果。所以 I1 要等 v4 的旧写入完成后才能进入 collector。
+
+这里必须区分“数据可用”和“写入完成”：I0 的结果进入写回缓冲、已经可以旁路时，RAW 消费者可以取得数据；但只要 I0 仍可能向 RF 写入，v4 的 WAW 占用就必须保留。生产者标签用于识别写者，**单独增加标签不能解决写回顺序问题**。
+
+collector 的接纳条件可以表达为：
+
+```text
+src_ok = 所有源均无未完成写者，或存在可正确接收的生产者旁路
+dst_ok = 所有目标均无未完成写者
+
+admit = wave 队首有效
+     && 本 wave 没有尚未发射的 collector 指令
+     && src_ok && dst_ok
+     && collector 及必要跟踪资源可分配
+```
+
+成功接纳时，先依据旧状态确定源数据来源，再原子地预留全部目标。这样 `v4 = v4 + v2` 能读取旧 v4，不会被自己刚设置的目标占用阻塞。多目标指令也要一次检查并预留全部目标，避免只占到一部分资源。
+
+还有几项会直接影响正确性：
+
+- **隐含依赖也要展开。** EXEC、VCC、SCC、MODE、寄存器寻址状态，以及运算实际需要的旧目标值，都要进入读写集合。
+- **宽操作数按寄存器范围检查。** 例如 `v[4:7]` 必须检查四个寄存器；第一版对一个 VGPR 的所有 lane 保守地整体跟踪，部分 lane 写入也按整个 VGPR 处理冲突。
+- **预留与解除必须配对。** 每个目标在对应写回真正生效后解除占用；多拍写入不能提前解除。没有实际写入的合法完成路径也必须释放预留，并用 wave 生命周期标签拒绝迟到反馈。
+- **寄存器冲突与 memory 顺序分别管理。** 访存地址别名、wait、fence、barrier 还需要完成计数器和对应的顺序控制，寄存器 scoreboard 无法替代它们。
+
+这样遇到依赖时，只阻塞相关 wave 的队首，其他 ready wave 继续使用空闲入口。后续如果性能数据表明 WAW 阻塞明显，再评估寄存器重命名；如果允许同 wave 提前收集多条指令，则需要重新加入显式 WAR 跟踪。
+
+本轮讨论及此前规划阶段的确认项已补记到 [code_promot](https://github.com/w00514231/GPU-/blob/main/code_promot)。正式设计文件仍待方案确认后单独写入。
