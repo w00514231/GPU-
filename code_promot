@@ -95,8 +95,12 @@ SGPR 是 scala engine 内的共享资源：同周期 SALU/SCTL 与 SMEM 并行�
 
 https://github.com/w00514231/GPU-
 
-### 助手（本轮结论）
+### 助手（本轮回复）
 
-已明确仓库为 `w00514231/GPU-`。建议先以“每 wave 保序、跨 wave 多发射”为基线，目标四条路径同周期各接收一条；再用阻塞原因计数器判断增加 VGPR 端口、memory credit 或同 wave 双发射中哪项最有价值。下一步优先确定 SGPR/VGPR 组织、每 CU 常驻 wave 数，以及 SMEM/VMEM 是否共用 memory issue 入口。
+第一版建议采用“每个 wave 保序、不同 wave 并行发射”的结构。让 `SALU/SCTL`、`SMEM`、`VALU`、`VMEM` 各有候选选择路径，同周期从不同的 ready wave 取指。若前端、执行单元和寄存器读端口都允许，目标峰值是每 CU 每周期 4 条 wave 指令；如果 SMEM/VMEM 共用一个 memory issue 入口，峰值降为 3。wave32 的一条向量指令仍按一条 issue 指令计。
+
+关键是共享 scoreboard 判断 RAW/WAW 依赖，并在发射前联合检查 SGPR/VGPR bank、operand collector、执行单元 ready 和 memory credit。`SALU/SCTL + SMEM` 争用 SGPR，`VALU + VMEM` 争用 VGPR；SCTL 改变 PC 或 EXEC 时只阻塞本 wave 的后续指令。先测量空槽原因，再决定是否增加寄存器读端口、collector、resident wave 或同 wave 双发射。
+
+详细方案和本次对话已同步到 [GitHub 的 code_promot](https://github.com/w00514231/GPU-/blob/main/code_promot)。下一步最关键的是确定：每 CU 最多驻留多少个 wave、SGPR/VGPR 的 bank 与读端口配置、SMEM 和 VMEM 是否共用 memory issue 入口。
 
 
