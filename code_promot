@@ -1,0 +1,102 @@
+# GPU issue 模块设计对话记录
+
+> 本文件记录本次 GPU issue 架构讨论中的用户要求和设计回复。后续对话按时间继续追加。
+
+## 2026-10-17/18（Asia/Hong_Kong）
+
+### 用户
+
+我现在需要设计一个用于GPU issue指令的模块，会涉及到issue的指令包括 SALU,SCTL,SMEM,VMEM,VALU指令，他们中VALU和VMEM需要读取VGPR，其余指令需要读取SGPR，执行SALU,SCTL指令的执行单元称为scala engine(SGPR在此单元中)，执行VALU的指令的单元称为vector engine(VGPR在此单元中)，你想帮我规划出方案，我们看看通过怎么方式可以尽量提升指令的IPC，我们的所有对话都帮我记录到github中的文件code_promot中
+
+### 助手
+
+我先检查当前仓库和现有设计约束，再给出一版以 IPC 为目标的 issue 架构方案。我会把这次讨论记录到仓库里的 `code_promot` 文件，并确认能否同步到 GitHub。
+
+当前目录不是 Git 仓库，也没有发现现成的 issue 模块代码。我会先按你描述的执行单元和寄存器位置建立性能模型，同时定位要写入的 GitHub 仓库。
+
+初步建议是“每个 wave 保序、不同 wave 并行”：标量与向量各自选取已就绪指令，同时用共享 scoreboard 管理跨单元依赖。这样能先获得并发收益，再决定是否值得增加昂贵的 VGPR 读端口或支持同一 wave 双发射。
+
+### 用户（补充）
+
+我的github有一个GPU_issue的仓库 使用这个
+
+我希望尽量提升尽量的IPC，最好的每个周期issue尽量多的指令，是wave32的架构
+
+### 助手：第一版架构方案
+
+#### 1. 定义目标和约束
+
+- 以一个计算单元（CU）每周期成功接收的 **wave 指令数** 定义 issue IPC；wave32 的一条 VALU 指令仍计为一条 issue 指令，而不是 32 条。
+- 指令分为五类：SALU、SCTL、SMEM 读取 SGPR；VALU、VMEM 读取 VGPR。SALU/SCTL 由同一个 scala engine 执行；VALU 由 vector engine 执行。SMEM/VMEM 的执行路径和 memory issue 吞吐量先作为参数。
+- 目标是多 wave 并行 issue。每类路径是否能同周期接收指令、SGPR/VGPR 的 bank/读端口数、前端宽度、执行单元吞吐量和 memory credit 共同决定上限。
+
+#### 2. 推荐的第一版微架构
+
+```text
+wave32 指令缓冲（每 wave 保序）
+           │
+           ▼
+  decode / 指令类别与寄存器依赖提取
+           │
+           ▼
+  共享 scoreboard + wave 状态 + memory/control 约束
+           │
+           ▼
+  各路径候选选择与联合资源仲裁
+     ├─ SALU/SCTL → SGPR 读 → scala engine
+     ├─ SMEM      → SGPR 读 → scalar memory path
+     ├─ VALU      → VGPR 读 → vector engine
+     └─ VMEM      → VGPR 读 → vector memory path
+```
+
+每个 wave 只让队首指令参与仲裁，第一版最多每 wave 每周期发一条；不同 wave 可在同一周期发往不同路径。这保持程序顺序，降低分支、EXEC mask、memory ordering 和异常处理复杂度。若需要同一 wave 双发射，留到有性能数据后再评估。
+
+发射必须是一次完整的握手：候选指令的依赖就绪、目标单元 ready、寄存器读资源、collector 槽位、memory credit 和 writeback 预留同时成立才弹出队首。不能先弹出再发现寄存器端口冲突。
+
+#### 3. 同周期并行能力
+
+优先实现以下四个独立接收路径：`scala(SALU 或 SCTL)`、`SMEM`、`VALU`、`VMEM`。理想情况下，四条来自不同 wave 且互不争用资源的指令可以同周期发射，理论峰值为 **4 wave 指令/周期/CU**。若 SMEM 与 VMEM 共用单一 memory issue 入口，峰值至多为 3；若某些执行单元不是每周期可接收，也应相应下调。4 是待验证的目标，不是当前硬件已具备的能力。
+
+SGPR 是 scala engine 内的共享资源：同周期 SALU/SCTL 与 SMEM 并行时，SGPR 读需求相加。VGPR 是 vector engine 内的共享资源：VALU 与 VMEM 并行时，VGPR 读需求相加。对每个 bank 必须满足读端口限制，而不只是总端口数。VMEM 地址或数据的操作数数量、VALU 操作数数量由实际 ISA 决定，不宜假定每条固定两个源寄存器。
+
+#### 4. 依赖与控制正确性
+
+- scoreboard 按 wave 和物理/架构寄存器标记在途写入；源寄存器有未完成生产者时阻止 RAW。无寄存器重命名时，也要防止较年轻指令的 WAW 提前完成并覆盖较老结果。
+- 寄存器源值在发射时完成读取，或由 operand collector 明确锁定；若读取推迟，需要处理读写先后和旁路。
+- SALU/VALU 结果在可用时前递给后续指令，前递点与 scoreboard 清除点一致，减少短依赖链气泡。
+- SCTL 中改变 PC、EXEC mask、同步状态的指令，对本 wave 设置控制屏障，直到状态确定才允许后续指令参与选择；其他 wave 不受此屏障影响。
+- SMEM/VMEM 允许多个在途请求，按实际 ISA 的 fence、barrier、原子操作和异常规则保序；用 credit 限制队列容量，不因一个 wave 的长延迟访存堵住所有 wave。
+
+#### 5. IPC 优化顺序
+
+1. **先消除无谓空槽**：前端每周期提供足够的候选 wave；类别独立选择器扫描 ready wave；用轮转或年龄优先避免长期饥饿。
+2. **再支持跨路径并发**：先测量 scala+VALU、VALU+VMEM、scala+SMEM 的组合频率。独立 issue slot 的收益取决于真实混合比例。
+3. **解决寄存器读取瓶颈**：VGPR 采用 bank 化和 operand collector；按真实 bank 冲突率决定是否增加读端口、复制 bank、增加 collector 或改进寄存器分配。盲目增加 32 lane VGPR 读端口会显著增加面积与布线压力。
+4. **隐藏长延迟**：维持足够 resident wave、memory outstanding credit 与返回缓冲；调度时优先选择 ready wave，而不是固定停在一个等待访存的 wave。
+5. **最后评估同 wave 双发射**：仅当 trace 显示跨 wave 并行仍填不满 issue slot，且存在足够多同 wave 独立相邻指令时再做。这一步会增加依赖检查、分支恢复与顺序语义成本。
+
+#### 6. 参数化性能模型与验证
+
+设前端宽度为 `D`，scala、SMEM、VALU、VMEM 每周期接收能力分别为 `C_s,C_sm,C_v,C_vm`，memory 总入口为 `C_m`，则任何周期的成功发射数受前端、各路径和共享资源联合限制。建议先在 trace/仿真中记录以下计数器：总 issue IPC、按类别 IPC、四路径同时发射比例、ready wave 数、scoreboard RAW/WAW 阻塞、SGPR/VGPR bank 冲突、执行单元 backpressure、memory credit 耗尽、SCTL 屏障周期、前端供给不足周期。
+
+用这些计数器做参数扫描：resident wave 数、每类 issue slot 数、SGPR/VGPR bank 与读端口、collector 深度、memory credit。比较 IPC 提升与面积/时序成本，选取 Pareto 点。
+
+#### 7. 下一轮需要确定
+
+1. 每个 CU 的 wave 数上限、前端每周期能提供几条候选指令，以及 SGPR/VGPR 的 bank/读端口组织。
+2. SMEM 和 VMEM 是否共享 memory issue 入口；各执行单元是否每周期都能接收一条新指令。
+3. SCTL 包含哪些指令（branch、barrier、EXEC 更新等），以及是否要求同一 wave 严格保序发射。
+
+### 助手（GitHub 定位进展）
+
+方案已经写入本地 `code_promot`：目标先定为 wave32 下的跨 wave 四路径并发；实际峰值要由前端宽度、SGPR/VGPR 读资源和 memory 入口共同约束。目前 GitHub 连接里只看到名为 `GPU-` 的仓库，没有看到 `GPU_issue`，我在等你给准确地址后同步。
+
+### 用户（仓库地址）
+
+https://github.com/w00514231/GPU-
+
+### 助手（本轮结论）
+
+已明确仓库为 `w00514231/GPU-`。建议先以“每 wave 保序、跨 wave 多发射”为基线，目标四条路径同周期各接收一条；再用阻塞原因计数器判断增加 VGPR 端口、memory credit 或同 wave 双发射中哪项最有价值。下一步优先确定 SGPR/VGPR 组织、每 CU 常驻 wave 数，以及 SMEM/VMEM 是否共用 memory issue 入口。
+
+
